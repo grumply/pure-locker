@@ -31,6 +31,69 @@ newLocker :: Ord k => IO (Locker k v)
 newLocker = newTMVarIO mempty
 {-# INLINE newLocker #-}
 
+acquireMany :: forall k v a. Ord k => (k -> IO v) -> Locker k v -> [k] -> IO (Map k v)
+acquireMany acquire locker_ (List.nub -> keys) = 
+  acquireAllTMVars >>= acquireAllVars 
+  where
+    -- Acquire all necessary TMVars
+    acquireAllTMVars :: IO [(k,TMVar v)]
+    acquireAllTMVars = mapM acquireVar keys 
+      where
+        acquireVar :: k -> IO (k,TMVar v)
+        acquireVar k = do
+          r <- atomically $ do
+            locker <- takeTMVar locker_
+            case Map.lookup k locker of
+              Just (n,Nothing) -> retry
+              Just (n,Just tv) -> do
+                putTMVar locker_ $! Map.insert k (n + 1,Just tv) locker
+                pure (Right tv)
+              Nothing -> do
+                tv <- newEmptyTMVar
+                putTMVar locker_ $! Map.insert k (1,Just tv) locker
+                pure (Left tv)
+          case r of
+            Right tv -> pure (k,tv)
+            Left  tv -> do
+              v <- acquire k
+              atomically (putTMVar tv v)
+              pure (k,tv)
+
+    -- Take all values in a single transaction, restarting as necessary
+    -- until they're all available. This is where contention can become an
+    -- issue and cause delays in completion. Other threads should be productive
+    -- when one thread is having trouble in phase2.
+    acquireAllVars :: [(k,TMVar v)] -> IO (Map k v)
+    acquireAllVars = fmap Map.fromList . atomically . mapM acquireVals
+      where
+        acquireVals (k,tv) = do
+          v <- takeTMVar tv
+          pure (k,v)
+
+releaseMany :: forall k v. Ord k => (k -> v -> IO ()) -> Locker k v -> Map k v -> IO ()
+releaseMany release locker_ = releaseAll . Map.toList
+  where
+    -- Put resources back in locker or release them if no longer required.
+    releaseAll :: [(k,v)] -> IO ()
+    releaseAll = mapM_ releaseVal 
+      where
+        releaseVal (k,v) = do
+          locker <- atomically (takeTMVar locker_)
+          case Map.lookup k locker of
+            Nothing -> error "withMany_ (phase4): invariant broken"
+            Just (n,Nothing) -> atomically $ putTMVar locker_ locker
+            Just (n,Just tv)
+              | n == 1 -> do
+                atomically $ putTMVar locker_ $! Map.insert k (0,Nothing) locker
+                release k v
+                atomically $ do
+                  locker <- takeTMVar locker_
+                  putTMVar locker_ $! Map.delete k locker
+              | otherwise -> 
+                atomically $ do
+                  putTMVar tv v
+                  putTMVar locker_ $! Map.insert k (n - 1,Just tv) locker
+
 -- | Deduplication of resource acquisition. Useful for resources shared between an
 -- arbitrary number of threads where the cost of resource acquisition is high.
 --
@@ -68,76 +131,17 @@ newLocker = newTMVarIO mempty
 -- NOTE: If you need to protect against `throwTo`, use a green thread.
 --
 withMany_ :: forall k v a. Ord k => (k -> IO v) -> (k -> v -> IO ()) -> Locker k v -> [k] -> (Map k v -> IO (a,Map k v)) -> IO a
-withMany_ acquire release locker_ (List.nub -> keys) action = do
-  !vars <- phase1
-  !vals <- phase2 vars
-  !x    <- phase3 vals 
-  !r    <- phase4 vals x
-  case r of
+withMany_ acquire release locker_ keys action = do
+  !vals <- acquireMany acquire locker_ keys
+  !x    <- work vals 
+  !r    <- releaseMany release locker_ (either (const vals) snd x)
+  case x of
     Left se -> throw se
-    Right r -> pure r
+    Right (r,_) -> pure r
   where
-    -- Acquire all necessary TMVars
-    phase1 :: IO [(k,TMVar v)]
-    phase1 = mapM acquireVar keys 
-      where
-        acquireVar :: k -> IO (k,TMVar v)
-        acquireVar k = do
-          r <- atomically $ do
-            locker <- takeTMVar locker_
-            case Map.lookup k locker of
-              Just (n,Nothing) -> retry
-              Just (n,Just tv) -> do
-                putTMVar locker_ $! Map.insert k (n + 1,Just tv) locker
-                pure (Right tv)
-              Nothing -> do
-                tv <- newEmptyTMVar
-                putTMVar locker_ $! Map.insert k (1,Just tv) locker
-                pure (Left tv)
-          case r of
-            Right tv -> pure (k,tv)
-            Left  tv -> do
-              v <- acquire k
-              atomically (putTMVar tv v)
-              pure (k,tv)
-
-    -- Take all values in a single transaction, restarting as necessary
-    -- until they're all available. This is where contention can become an
-    -- issue and cause delays in completion. Other threads should be productive
-    -- when one thread is having trouble in phase2.
-    phase2 :: [(k,TMVar v)] -> IO [(k,v)]
-    phase2 = atomically . mapM acquireVals
-      where
-        acquireVals (k,tv) = do
-          v <- takeTMVar tv
-          pure (k,v)
-
     -- Run the supplied action with the acquired values
-    phase3 :: [(k,v)] -> IO (Either SomeException (a,Map k v))
-    phase3 = try @SomeException . action . Map.fromList
-    
-    -- Put resources back in locker or release them if no longer required.
-    phase4 :: [(k,v)] -> Either SomeException (a,Map k v) -> IO (Either SomeException a)
-    phase4 vals es = do
-      mapM_ releaseVal (either (const vals) (Map.toList . snd) es)
-      pure (fmap fst es)
-      where
-        releaseVal (k,v) = do
-          locker <- atomically (takeTMVar locker_)
-          case Map.lookup k locker of
-            Nothing -> error "withMany_ (phase4): invariant broken"
-            Just (n,Nothing) -> atomically $ putTMVar locker_ locker
-            Just (n,Just tv)
-              | n == 1 -> do
-                atomically $ putTMVar locker_ $! Map.insert k (0,Nothing) locker
-                release k v
-                atomically $ do
-                  locker <- takeTMVar locker_
-                  putTMVar locker_ $! Map.delete k locker
-              | otherwise -> 
-                atomically $ do
-                  putTMVar tv v
-                  putTMVar locker_ $! Map.insert k (n - 1,Just tv) locker
+    work :: Map k v -> IO (Either SomeException (a,Map k v))
+    work = try @SomeException . action
 {-# INLINABLE withMany_ #-}
 
 -- | A variant of `withMany_` that uses `Resource` to simplify acquisition and
