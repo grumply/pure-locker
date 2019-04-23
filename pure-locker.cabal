@@ -22,6 +22,8 @@ library
   build-depends:       
     base >=4.11 && <4.12,
     stm,
-    containers
+    containers,
+    exceptions,
+    mtl
   hs-source-dirs:      src
   default-language:    Haskell2010

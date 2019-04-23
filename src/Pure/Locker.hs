@@ -9,8 +9,10 @@ import Data.Map
 
 import Control.Concurrent
 import Control.Concurrent.STM
-import Control.Exception
+import Control.Exception (SomeException)
 import Control.Monad
+import Control.Monad.Catch
+import Control.Monad.IO.Class
 
 import Data.List as List
 import Data.Map as Map
@@ -31,17 +33,17 @@ newLocker :: Ord k => IO (Locker k v)
 newLocker = newTMVarIO mempty
 {-# INLINE newLocker #-}
 
-acquireMany :: forall k v a. Ord k => (k -> IO v) -> Locker k v -> [k] -> IO (Map k v)
+acquireMany :: forall k v a m. (MonadIO m, Ord k) => (k -> m v) -> Locker k v -> [k] -> m (Map k v)
 acquireMany acquire locker_ (List.nub -> keys) = 
   acquireAllTMVars >>= acquireAllVars 
   where
     -- Acquire all necessary TMVars
-    acquireAllTMVars :: IO [(k,TMVar v)]
+    acquireAllTMVars :: m [(k,TMVar v)]
     acquireAllTMVars = mapM acquireVar keys 
       where
-        acquireVar :: k -> IO (k,TMVar v)
+        acquireVar :: k -> m (k,TMVar v)
         acquireVar k = do
-          r <- atomically $ do
+          r <- liftIO $ atomically $ do
             locker <- takeTMVar locker_
             case Map.lookup k locker of
               Just (n,Nothing) -> retry
@@ -56,41 +58,41 @@ acquireMany acquire locker_ (List.nub -> keys) =
             Right tv -> pure (k,tv)
             Left  tv -> do
               v <- acquire k
-              atomically (putTMVar tv v)
+              liftIO $ atomically (putTMVar tv v)
               pure (k,tv)
 
     -- Take all values in a single transaction, restarting as necessary
     -- until they're all available. This is where contention can become an
     -- issue and cause delays in completion. Other threads should be productive
     -- when one thread is having trouble in phase2.
-    acquireAllVars :: [(k,TMVar v)] -> IO (Map k v)
-    acquireAllVars = fmap Map.fromList . atomically . mapM acquireVals
+    acquireAllVars :: [(k,TMVar v)] -> m (Map k v)
+    acquireAllVars = fmap Map.fromList . liftIO . atomically . mapM acquireVals
       where
         acquireVals (k,tv) = do
           v <- takeTMVar tv
           pure (k,v)
 
-releaseMany :: forall k v. Ord k => (k -> v -> IO ()) -> Locker k v -> Map k v -> IO ()
+releaseMany :: forall m k v. (MonadIO m, Ord k) => (k -> v -> m ()) -> Locker k v -> Map k v -> m ()
 releaseMany release locker_ = releaseAll . Map.toList
   where
     -- Put resources back in locker or release them if no longer required.
-    releaseAll :: [(k,v)] -> IO ()
+    releaseAll :: [(k,v)] -> m ()
     releaseAll = mapM_ releaseVal 
       where
         releaseVal (k,v) = do
-          locker <- atomically (takeTMVar locker_)
+          locker <- liftIO $ atomically (takeTMVar locker_)
           case Map.lookup k locker of
             Nothing -> error "withMany_ (phase4): invariant broken"
-            Just (n,Nothing) -> atomically $ putTMVar locker_ locker
+            Just (n,Nothing) -> liftIO $ atomically $ putTMVar locker_ locker
             Just (n,Just tv)
               | n == 1 -> do
-                atomically $ putTMVar locker_ $! Map.insert k (0,Nothing) locker
+                liftIO $ atomically $ putTMVar locker_ $! Map.insert k (0,Nothing) locker
                 release k v
-                atomically $ do
+                liftIO $ atomically $ do
                   locker <- takeTMVar locker_
                   putTMVar locker_ $! Map.delete k locker
               | otherwise -> 
-                atomically $ do
+                liftIO $ atomically $ do
                   putTMVar tv v
                   putTMVar locker_ $! Map.insert k (n - 1,Just tv) locker
 
@@ -130,62 +132,62 @@ releaseMany release locker_ = releaseAll . Map.toList
 --
 -- NOTE: If you need to protect against `throwTo`, use a green thread.
 --
-withMany_ :: forall k v a. Ord k => (k -> IO v) -> (k -> v -> IO ()) -> Locker k v -> [k] -> (Map k v -> IO (a,Map k v)) -> IO a
+withMany_ :: forall k v a m. (MonadIO m, Ord k, MonadCatch m) => (k -> m v) -> (k -> v -> m ()) -> Locker k v -> [k] -> (Map k v -> m (a,Map k v)) -> m a
 withMany_ acquire release locker_ keys action = do
   !vals <- acquireMany acquire locker_ keys
   !x    <- work vals 
   !r    <- releaseMany release locker_ (either (const vals) snd x)
   case x of
-    Left se -> throw se
+    Left se -> throwM se
     Right (r,_) -> pure r
   where
     -- Run the supplied action with the acquired values
-    work :: Map k v -> IO (Either SomeException (a,Map k v))
-    work = try @SomeException . action
+    work :: Map k v -> m (Either SomeException (a,Map k v))
+    work = try . action
 {-# INLINABLE withMany_ #-}
 
 -- | A variant of `withMany_` that uses `Resource` to simplify acquisition and
 -- release of resources.
-withMany :: (Ord k, Resource k v) => Locker k v -> [k] -> (Map k v -> IO (a,Map k v)) -> IO a
-withMany = withMany_ acquire release
+withMany :: (Ord k, Resource k v, MonadCatch m, MonadIO m) => Locker k v -> [k] -> (Map k v -> m (a,Map k v)) -> m a
+withMany = withMany_ (liftIO . acquire) (\k v -> liftIO $ release k v)
 {-# INLINE withMany #-}
 
 -- | A variant of `withMany_` that treats the resources `v` as mutable.
-withManyMutable_ :: (Ord k) => (k -> IO v) -> (k -> v -> IO ()) -> Locker k v -> [k] -> (Map k v -> IO a) -> IO a
+withManyMutable_ :: (Ord k, MonadCatch m, MonadIO m) => (k -> m v) -> (k -> v -> m ()) -> Locker k v -> [k] -> (Map k v -> m a) -> m a
 withManyMutable_ acquire release locker_ keys action = 
   withMany_ acquire release locker_ keys (\m -> action m >>= \a -> pure (a,m))
 {-# INLINE withManyMutable_ #-}
 
 -- | A variant of `withManyMutable_` that uses `Resource` to simplify
 -- acquisition and release of resources.
-withManyMutable :: (Ord k, Resource k v) => Locker k v -> [k] -> (Map k v -> IO a) -> IO a
+withManyMutable :: (Ord k, Resource k v, MonadCatch m, MonadIO m) => Locker k v -> [k] -> (Map k v -> m a) -> m a
 withManyMutable locker_ keys action = 
-  withMany_ acquire release locker_ keys (\m -> action m >>= \a -> pure (a,m))
+  withMany_ (liftIO . acquire) (\k v -> liftIO (release k v)) locker_ keys (\m -> action m >>= \a -> pure (a,m))
 {-# INLINE withManyMutable #-}
 
 -- | A variant of `withMany_` that acquires a single resource.
-with_ :: (Ord k) => (k -> IO v) -> (k -> v -> IO ()) -> Locker k v -> k -> (v -> IO (a,v)) -> IO a
+with_ :: (Ord k, MonadCatch m, MonadIO m) => (k -> m v) -> (k -> v -> m ()) -> Locker k v -> k -> (v -> m (a,v)) -> m a
 with_ acquire release locker_ key action = 
   withMany_ acquire release locker_ [key] (\m -> action (m Map.! key) >>= \(a,v) -> pure (a,Map.singleton key v))
 {-# INLINE with_ #-}
 
 -- | A variant of `with_` that uses `Resource` to simplify acquisition and
 -- release of the resource.
-with :: (Ord k, Resource k v) => Locker k v -> k -> (v -> IO (a,v)) -> IO a
+with :: (Ord k, Resource k v, MonadCatch m, MonadIO m) => Locker k v -> k -> (v -> m (a,v)) -> m a
 with locker_ key action = 
-  withMany_ acquire release locker_ [key] (\m -> action (m Map.! key) >>= \(a,v) -> pure (a,Map.singleton key v))
+  withMany_ (liftIO . acquire) (\k v -> liftIO (release k v)) locker_ [key] (\m -> action (m Map.! key) >>= \(a,v) -> pure (a,Map.singleton key v))
 {-# INLINE with #-}
 
 -- | A variant of `withMany_` that acquires a single resource and treats the
 -- resource `v` as mutable.
-withMutable_ :: (Ord k) => (k -> IO v) -> (k -> v -> IO ()) -> Locker k v -> k -> (v -> IO a) -> IO a
+withMutable_ :: (Ord k, MonadCatch m, MonadIO m) => (k -> m v) -> (k -> v -> m ()) -> Locker k v -> k -> (v -> m a) -> m a
 withMutable_ acquire release locker_ key action = 
   withMany_ acquire release locker_ [key] (\m -> action (m Map.! key) >>= \a -> pure (a,m))
 {-# INLINE withMutable_ #-}
 
 -- | A variant of `withMutable_` that uses `Resource` to simplify acquisition
 -- and release of the resource.
-withMutable :: (Ord k, Resource k v) => Locker k v -> k -> (v -> IO a) -> IO a
+withMutable :: (Ord k, Resource k v, MonadCatch m, MonadIO m) => Locker k v -> k -> (v -> m a) -> m a
 withMutable locker_ key action = 
   withManyMutable locker_ [key] (action . (Map.! key))
 {-# INLINE withMutable #-}
